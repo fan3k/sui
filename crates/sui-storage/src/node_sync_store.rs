@@ -24,12 +24,14 @@ use tracing::trace;
 #[cfg(test)]
 use std::sync::Arc;
 
-/// NodeSyncStore store is used by nodes to store downloaded objects (pending_certs, etc) that have
+/// NodeSyncStore store is used by nodes to store received certificates and effects that have
 /// not yet been applied to the node's SuiDataStore.
 #[derive(DBMapUtils)]
 pub struct NodeSyncStore {
-    /// Certificates that have been fetched from remote validators, but not sequenced.
+    /// Certificates that have been received from clients, received from consensus and fetched from
+    /// remote validators, but not yet sequenced and executed.
     /// Entries are cleared after execution.
+    /// TODO: remove this table eventually, and replay the certificates from upstream for recovery.
     pending_certs: DBMap<(EpochId, TransactionDigest), TrustedCertificate>,
 
     /// Verified true effects.
@@ -106,6 +108,14 @@ impl NodeSyncStore {
         tx: &TransactionDigest,
     ) -> SuiResult<Option<VerifiedCertificate>> {
         Ok(self.pending_certs.get(&(epoch_id, *tx))?.map(|c| c.into()))
+    }
+
+    pub fn all_pending_certs(&self) -> SuiResult<Vec<VerifiedCertificate>> {
+        Ok(self
+            .pending_certs
+            .iter()
+            .map(|(_, cert)| cert.into())
+            .collect())
     }
 
     pub fn get_effects(

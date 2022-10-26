@@ -6,6 +6,7 @@ use std::hash::Hash;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 use std::{
     collections::{HashMap, VecDeque},
     pin::Pin,
@@ -32,16 +33,18 @@ use prometheus::{
     register_int_gauge_with_registry, Histogram, IntCounter, IntGauge,
 };
 use tap::TapFallible;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::sync::{
     broadcast::{self, error::RecvError},
     mpsc,
 };
+use tokio::time::sleep;
 use tracing::Instrument;
 use tracing::{debug, error, instrument, warn};
 use typed_store::Map;
 
 pub use authority_store::{
-    AuthorityStore, GatewayStore, PendingDigest, ResolverWrapper, SuiDataStore, UpdateType,
+    AuthorityStore, GatewayStore, ResolverWrapper, SuiDataStore, UpdateType,
 };
 use narwhal_config::{
     Committee as ConsensusCommittee, WorkerCache as ConsensusWorkerCache,
@@ -101,8 +104,11 @@ use crate::{
     metrics::start_timer,
     query_helpers::QueryHelpers,
     transaction_input_checker,
+    transaction_manager::TransactionManager,
     transaction_streamer::TransactionStreamer,
 };
+
+use self::authority_store::ObjectKey;
 
 #[cfg(test)]
 #[path = "unit_tests/authority_tests.rs"]
@@ -123,13 +129,15 @@ mod gas_tests;
 pub mod authority_store_tables;
 
 pub mod authority_notifier;
-mod authority_store;
+pub(crate) mod authority_store;
 
 pub const MAX_ITEMS_LIMIT: u64 = 1_000;
 const BROADCAST_CAPACITY: usize = 10_000;
 
 pub(crate) const MAX_TX_RECOVERY_RETRY: u32 = 3;
 type CertTxGuard<'a> = DBTxGuard<'a, TrustedCertificate>;
+
+const OBJECT_MANAGER_SCAN_INTERNAL: Duration = Duration::from_secs(10);
 
 pub type ReconfigConsensusMessage = (
     AuthorityKeyPair,
@@ -156,6 +164,11 @@ pub struct AuthorityMetrics {
     handle_transaction_latency: Histogram,
     handle_certificate_latency: Histogram,
     handle_node_sync_certificate_latency: Histogram,
+
+    pub(crate) transaction_manager_num_missing_objects: IntGauge,
+    pub(crate) transaction_manager_num_pending_certificates: IntGauge,
+    pub(crate) transaction_manager_objects_notified_via_scan: IntGauge,
+    pub(crate) transaction_manager_num_ready: IntGauge,
 
     total_consensus_txns: IntCounter,
     skipped_consensus_txns: IntCounter,
@@ -298,6 +311,30 @@ impl AuthorityMetrics {
                 "fullnode_handle_node_sync_certificate_latency",
                 "Latency of fullnode handling certificate from node sync",
                 LATENCY_SEC_BUCKETS.to_vec(),
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_num_missing_objects: register_int_gauge_with_registry!(
+                "transaction_manager_num_missing_objects",
+                "Current number of missing objects in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_num_pending_certificates: register_int_gauge_with_registry!(
+                "transaction_manager_num_pending_certificates",
+                "Current number of pending certificates in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_objects_notified_via_scan: register_int_gauge_with_registry!(
+                "transaction_manager_objects_notified_via_scan",
+                "Current number of input objects found available via scanning in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_num_ready: register_int_gauge_with_registry!(
+                "transaction_manager_num_ready",
+                "Current number of ready digests in TransactionManager",
                 registry,
             )
             .unwrap(),
@@ -490,6 +527,12 @@ pub struct AuthorityState {
 
     committee_store: Arc<CommitteeStore>,
 
+    /// Manages pending certificates and their missing input objects.
+    transaction_manager: Arc<tokio::sync::Mutex<TransactionManager>>,
+
+    /// Publishes certificates that are ready to be executed.
+    rx_ready_certificates: tokio::sync::Mutex<UnboundedReceiver<VerifiedCertificate>>,
+
     // Structures needed for handling batching and notifications.
     /// The sender to notify of new transactions
     /// and create batches for this authority.
@@ -672,7 +715,6 @@ impl AuthorityState {
         &self,
         certificate: &VerifiedCertificate,
     ) -> SuiResult<VerifiedTransactionInfoResponse> {
-        let _metrics_guard = start_timer(self.metrics.handle_certificate_latency.clone());
         self.handle_certificate_impl(certificate, false).await
     }
 
@@ -690,6 +732,7 @@ impl AuthorityState {
         certificate: &VerifiedCertificate,
         bypass_validator_halt: bool,
     ) -> SuiResult<VerifiedTransactionInfoResponse> {
+        let _metrics_guard = start_timer(self.metrics.handle_certificate_latency.clone());
         self.metrics.total_cert_attempts.inc();
         if self.is_fullnode() {
             return Err(SuiError::GenericStorageError(
@@ -817,7 +860,7 @@ impl AuthorityState {
         // this function occur before we have written anything to the db, so we commit the tx
         // guard and rely on the client to retry the tx (if it was transient).
         let (inner_temporary_store, signed_effects) =
-            match self.prepare_certificate(certificate, digest).await {
+            match self.prepare_certificate(certificate).await {
                 Err(e) => {
                     debug!(name = ?self.name, ?digest, "Error preparing transaction: {e}");
                     tx_guard.release();
@@ -833,6 +876,11 @@ impl AuthorityState {
         // will be persisted in the log for later recovery.
         let notifier_ticket = self.batch_notifier.ticket(bypass_validator_halt)?;
         let ticket_seq = notifier_ticket.seq();
+        let output_keys: Vec<_> = inner_temporary_store
+            .written
+            .iter()
+            .map(|(_, ((id, seq, _), _, _))| ObjectKey(*id, *seq))
+            .collect();
         let res = self
             .commit_certificate(
                 inner_temporary_store,
@@ -905,6 +953,14 @@ impl AuthorityState {
         // commit_certificate finished, the tx is fully committed to the store.
         tx_guard.commit_tx();
 
+        // Notifies transaction manager about available input objects. This allows the transaction
+        // manager to schedule ready transactions.
+        // TODO: switch TransactionManager to use notify_read() on objects table.
+        {
+            let mut transaction_manager = self.transaction_manager.lock().await;
+            transaction_manager.objects_committed(output_keys);
+        }
+
         // index certificate
         let _ = self
             .post_process_one_tx(seq, &digest)
@@ -949,7 +1005,6 @@ impl AuthorityState {
     async fn prepare_certificate(
         &self,
         certificate: &VerifiedCertificate,
-        transaction_digest: TransactionDigest,
     ) -> SuiResult<(InnerTemporaryStore, SignedTransactionEffects)> {
         let _metrics_guard = start_timer(self.metrics.prepare_certificate_latency.clone());
         let (gas_status, input_objects) =
@@ -966,7 +1021,7 @@ impl AuthorityState {
             // only be executed at a time when consensus is turned off.
             // TODO: Add some assert here to make sure consensus is indeed off with
             // is_change_epoch_tx.
-            self.check_shared_locks(&transaction_digest, &shared_object_refs)
+            self.check_shared_locks(certificate.digest(), &shared_object_refs)
                 .await?;
         }
 
@@ -977,13 +1032,13 @@ impl AuthorityState {
 
         let transaction_dependencies = input_objects.transaction_dependencies();
         let temporary_store =
-            TemporaryStore::new(self.database.clone(), input_objects, transaction_digest);
+            TemporaryStore::new(self.database.clone(), input_objects, *certificate.digest());
         let (inner_temp_store, effects, _execution_error) =
             execution_engine::execute_transaction_to_effects(
                 shared_object_refs,
                 temporary_store,
                 certificate.signed_data.data.clone(),
-                transaction_digest,
+                *certificate.digest(),
                 transaction_dependencies,
                 &self.move_vm,
                 &self._native_functions,
@@ -1405,6 +1460,7 @@ impl AuthorityState {
 
     // TODO: This function takes both committee and genesis as parameter.
     // Technically genesis already contains committee information. Could consider merging them.
+    #[allow(clippy::disallowed_methods)]
     pub async fn new(
         name: AuthorityName,
         secret: StableSyncAuthoritySigner,
@@ -1436,12 +1492,18 @@ impl AuthorityState {
                 .await
                 .expect("Cannot bulk insert genesis objects");
         }
-
         let committee = committee_store.get_latest_committee();
-
         let module_cache = Arc::new(SyncModuleCache::new(ResolverWrapper(store.clone())));
         let event_handler =
             event_store.map(|es| Arc::new(EventHandler::new(es, module_cache.clone())));
+        let metrics = Arc::new(AuthorityMetrics::new(prometheus_registry));
+        let (tx_ready_certificates, rx_ready_certificates) = unbounded_channel();
+        let transaction_manager = Arc::new(tokio::sync::Mutex::new(TransactionManager::new(
+            store.clone(),
+            node_sync_store.clone(),
+            tx_ready_certificates,
+            metrics.clone(),
+        )));
 
         let mut state = AuthorityState {
             name,
@@ -1459,13 +1521,15 @@ impl AuthorityState {
             transaction_streamer,
             checkpoints,
             committee_store,
+            transaction_manager: transaction_manager.clone(),
+            rx_ready_certificates: tokio::sync::Mutex::new(rx_ready_certificates),
             batch_channels: tx,
             batch_notifier: Arc::new(
                 authority_notifier::TransactionNotifier::new(store.clone(), prometheus_registry)
                     .expect("Notifier cannot start."),
             ),
             consensus_guardrail: AtomicUsize::new(0),
-            metrics: Arc::new(AuthorityMetrics::new(prometheus_registry)),
+            metrics,
             tx_reconfigure_consensus,
         };
 
@@ -1514,6 +1578,34 @@ impl AuthorityState {
                     .expect("Should see no errors updating the checkpointing mechanism.");
             }
         }
+
+        // Start a periodic process to check transactions that are ready.
+        // This is necessary even though we try to notify TransactionManager about each committed
+        // object, because currently there is no transaction semantics for data store.
+        // The following is possible:
+        // 1. A certificate enters TransactionManager, and gathers its missing input objects.
+        // 2. One of its missing input object is committed, and notifies TransactionManager. No action
+        //    will be taken since the input object is not yet part of TransactionManager's data.
+        // 3. TransactionManager saves the certificate's missing input into its data structure,
+        //    including the object just committed.
+        // TODO: switch TransactionManager to use notify_read() on objects table.
+        let weak_transaction_manager = Arc::downgrade(&transaction_manager);
+        tokio::task::spawn(async move {
+            loop {
+                sleep(OBJECT_MANAGER_SCAN_INTERNAL).await;
+                {
+                    let transaction_manager_arc_guard =
+                        if let Some(transaction_manager) = weak_transaction_manager.upgrade() {
+                            transaction_manager
+                        } else {
+                            // Shut down.
+                            return;
+                        };
+                    let mut transaction_manager = transaction_manager_arc_guard.lock().await;
+                    transaction_manager.scan_ready_transactions();
+                }
+            }
+        });
 
         state
     }
@@ -1590,36 +1682,13 @@ impl AuthorityState {
         .await
     }
 
-    pub fn add_pending_sequenced_certificate(&self, cert: VerifiedCertificate) -> SuiResult {
-        self.add_pending_impl(vec![(*cert.digest(), Some(cert))], true)
-    }
-
-    /// Add a number of certificates to the pending transactions as well as the
-    /// certificates structure if they are not already executed.
-    /// Certificates are optional, and if not provided, they will be eventually
-    /// downloaded in the execution driver.
-    pub fn add_pending_certificates(
-        &self,
-        certs: Vec<(TransactionDigest, Option<VerifiedCertificate>)>,
-    ) -> SuiResult<()> {
-        self.add_pending_impl(certs, false)
-    }
-
-    fn add_pending_impl(
-        &self,
-        certs: Vec<(TransactionDigest, Option<VerifiedCertificate>)>,
-        is_sequenced: bool,
-    ) -> SuiResult {
+    /// Adds certificates to the pending certificate store and transaction manager for ordered execution.
+    pub async fn add_pending_certificates(&self, certs: Vec<VerifiedCertificate>) -> SuiResult<()> {
+        // TODO: skip storing the certs and remove pending_certs table eventually.
         self.node_sync_store
-            .batch_store_certs(certs.iter().filter_map(|(_, cert_opt)| cert_opt.clone()))?;
-
-        self.database.add_pending_digests(
-            certs
-                .iter()
-                .map(|(seq_and_digest, _)| *seq_and_digest)
-                .collect(),
-            is_sequenced,
-        )
+            .batch_store_certs(certs.iter().cloned())?;
+        let mut transaction_manager = self.transaction_manager.lock().await;
+        transaction_manager.enqueue(certs)
     }
 
     // Continually pop in-progress txes from the WAL and try to drive them to completion.
@@ -1704,6 +1773,16 @@ impl AuthorityState {
         object_id: &ObjectID,
     ) -> Result<Option<Object>, SuiError> {
         self.database.get_object(object_id)
+    }
+
+    /// Reads the next certificate ready to execute, published by the transaction manager.
+    pub(crate) async fn next_ready_certificate(&self) -> Option<VerifiedCertificate> {
+        let mut rx_ready_certificates = self.rx_ready_certificates.lock().await;
+        let cert = rx_ready_certificates.recv().await;
+        if cert.is_some() {
+            self.metrics.transaction_manager_num_ready.dec();
+        }
+        cert
     }
 
     pub async fn get_framework_object_ref(&self) -> SuiResult<ObjectRef> {
@@ -2266,18 +2345,21 @@ impl AuthorityState {
                     "handle_consensus_transaction UserTransaction",
                 );
 
-                // Schedule the certificate for execution
-                self.add_pending_sequenced_certificate(certificate.clone())?;
-
+                // Lock before scheduling pending certificates, otherwise the scheduled
+                // certificates may execute immediately but unable to find locks.
                 if certificate.contains_shared_object() {
                     self.database
                         .lock_shared_objects(&certificate, consensus_index)
-                        .await
+                        .await?;
                 } else {
                     self.database
                         .record_owned_object_cert_from_consensus(&certificate, consensus_index)
-                        .await
+                        .await?;
                 }
+
+                // Schedule the certificate for execution later.
+                self.add_pending_certificates(vec![certificate.clone()])
+                    .await
             }
             ConsensusTransactionKind::Checkpoint(fragment) => {
                 match &fragment.message {

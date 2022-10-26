@@ -1,10 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{
-    authority_store::{InternalSequenceNumber, ObjectKey, PendingDigest},
-    *,
-};
+use super::{authority_store::ObjectKey, *};
 use narwhal_executor::ExecutionIndices;
 use rocksdb::Options;
 use serde::{Deserialize, Serialize};
@@ -24,15 +21,6 @@ pub struct AuthorityEpochTables<S> {
     /// This is map between the transaction digest and transactions found in the `transaction_lock`.
     #[default_options_override_fn = "transactions_table_default_config"]
     pub(crate) transactions: DBMap<TransactionDigest, TrustedTransactionEnvelope<S>>,
-
-    /// The pending execution table holds a sequence of transactions that are present
-    /// in the certificates table, but may not have yet been executed, and should be executed.
-    /// The source of these certificates might be (1) the checkpoint proposal process (2) the
-    /// gossip processes (3) the shared object post-consensus task. An active authority process
-    /// reads this table and executes the certificates. The order is a hint as to their
-    /// causal dependencies. Note that there is no guarantee digests are unique. Once executed, and
-    /// effects are written the entry should be deleted.
-    pub(crate) pending_execution: DBMap<InternalSequenceNumber, PendingDigest>,
 
     /// Hold the lock for shared objects. These locks are written by a single task: upon receiving a valid
     /// certified transaction from consensus, the authority assigns a lock to each shared objects of the
